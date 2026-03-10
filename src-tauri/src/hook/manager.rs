@@ -28,57 +28,71 @@ fn flush_record(record: &mut WindowRecord) {
     // TODO: Record to DB
 }
 
-pub async fn start_hook() {
-    let mut last_title = String::new();
-    let mut current_record: Option<WindowRecord> = None;
+pub async fn start_hook(conn: Connection, rules: Vec<Rule>) {
+    let mut current: Option<WindowRecord> = None;
     let mut idle_detector = IdleDetector::new();
+    let mut interval = time::interval(Duration::from_millis(500));
 
     println!("[HOOK] Window logger started (500ms poll, 5min idle threshold)");
 
     loop {
-        let idle_status = idle_detector.check();
+        interval.tick().await;
 
-        match idle_status {
+        match idle_detector.check() {
             IdleStatus::BecameIdle => {
-                // User just went idle — flush current record and insert IDLE entry
-                if let Some(mut record) = current_record.take() {
-                    flush_record(&mut record);
+                if let Some(mut rec) = current.take() {
+                    rec.duration = rec.start_time.elapsed().as_millis() as u64;
+                    persist_record(&conn, &rules, rec, true);
                 }
-                println!("[HOOK] IDLE detected — pausing time accumulation");
-                last_title.clear();
             }
-            IdleStatus::StillIdle => {
-                // Do nothing while idle
-            }
+            IdleStatus::StillIdle => {}
             IdleStatus::ResumedActivity | IdleStatus::Active => {
-                if idle_status == IdleStatus::ResumedActivity {
-                    println!("[HOOK] Activity resumed");
-                }
+                if let Some((app_name, window_title)) = get_active_window() {
+                    let should_switch = current.as_ref().map_or(true, |c| {
+                        c.app_name != app_name || c.window_title != window_title
+                    });
 
-                if let Some((title, app_name)) = get_active_window() {
-                    if title != last_title {
-                        let now = now_secs();
-
-                        // Flush previous record
-                        if let Some(mut record) = current_record.take() {
-                            flush_record(&mut record);
+                    if should_switch {
+                        if let Some(mut old_rec) = current.take() {
+                            old_rec.duration = old_rec.start_time.elapsed().as_millis() as u64;
+                            persist_record(&conn, &rules, old_rec, false);
                         }
-
-                        // Start new record
-                        current_record = Some(WindowRecord {
-                            timestamp: now,
-                            app_name: app_name.clone(),
-                            window_title: title.clone(),
-                            start_time: now,
+                        current = Some(WindowRecord {
+                            timestamp: SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_millis() as u64,
+                            app_name: app_name,
+                            window_title: window_title,
+                            start_time: Instant::now(),
                             duration: 0,
                         });
-
-                        last_title = title;
                     }
                 }
             }
         }
-
-        sleep(Duration::from_millis(500)).await;
     }
+}
+
+fn persist_record(conn: &Connection, rules: &[Rule], rec: WindowRecord, is_idle: bool) {
+    let matter_id = classifier::classify(&rec.window_title, rules);
+    let _ = db::insert_window_log(
+        conn,
+        rec.timestamp as i64,
+        &rec.app_name,
+        &rec.window_title,
+        rec.duration as i64,
+        is_idle,
+        matter_id,
+    );
+    
+    let tag = matter_id.map_or("Unclassified".to_string(), |id| format!("Matter #{}", id));
+    println!(
+        "[{}] {} | {} | {}ms | {}",
+        if is_idle { "IDLE" } else { "LOG" },
+        rec.app_name,
+        rec.window_title,
+        rec.duration,
+        tag
+    );
 }
